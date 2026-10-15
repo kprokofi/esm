@@ -1,11 +1,3 @@
-# /// script
-# requires-python = "<=3.13"
-# dependencies = [
-#     "abnumber",
-#     "esm",
-#     "modal",
-# ]
-# ///
 """
 Code for binder design with ESMFold2 and ESMC.
 
@@ -20,12 +12,12 @@ import string
 import time
 from dataclasses import dataclass
 from functools import cache
+from pathlib import Path
 from typing import Any
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import biotite.structure
-import modal
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -205,7 +197,7 @@ def build_gradient_mask(sequence: str, batch_size: int) -> torch.Tensor:
     return mask
 
 
-def sequence_to_one_hot(sequence: str, device="cuda") -> torch.Tensor:
+def sequence_to_one_hot(sequence: str, device: torch.device | str) -> torch.Tensor:
     """Convert target string to one-hot tensor [1, L_target, num_tokens]."""
 
     const_dict = {token: i for i, token in enumerate(TOKENS)}
@@ -695,14 +687,16 @@ def fold_and_get_distogram(
         inputs_list.append(prepare_esmfold2_tensors(inputs_raw, max_atoms=max_atoms))
 
     inputs = {
-        key: torch.stack([inp[key] for inp in inputs_list], dim=0).cuda()
+        key: torch.stack([inp[key] for inp in inputs_list], dim=0).to(
+            target_one_hot.device
+        )
         for key in inputs_list[0]
     }
     inputs["res_type_soft"] = torch.cat(
         (target_one_hot.repeat(design.size(0), 1, 1), padded_design), dim=1
     )
 
-    with seed_context(seed):
+    with seed_context(seed, device_type=target_one_hot.device.type):
         output = model(
             **inputs,
             num_diffusion_samples=1,
@@ -972,6 +966,7 @@ def design_binder(
     batch_size: int = 1,
     target_hotspot_ids: list[str] | None = None,
     epitope_contact_distance: float = 12.0,
+    device: torch.device | str = "cpu",
 ) -> tuple[list[str], Trajectory, list[dict]]:
     """
     Algorithm 11 Gradient-Guided Binder Sequence Optimization.
@@ -988,7 +983,7 @@ def design_binder(
     residue IDs within the provided target sequence, for example ``["L150"]``.
     """
     # Setup
-    device = "cuda"
+    device = torch.device(device)
     if target_name in TARGET_SEQUENCES:
         if target_sequence is not None:
             raise ValueError(
@@ -1028,7 +1023,7 @@ def design_binder(
     assert "|" not in target_sequence
     assert "|" not in binder_sequence
 
-    with seed_context(seed), torch.device(device):
+    with seed_context(seed, device_type=device.type), torch.device(device):
         logits = build_initial_soft_sequence_logits(
             binder_sequence, batch_size=batch_size
         )
@@ -1045,7 +1040,10 @@ def design_binder(
         calculate_confidence: bool,
     ) -> tuple[torch.Tensor, list[str], list[float] | None]:
         nonlocal global_step
-        torch.cuda.reset_peak_memory_stats()
+        if device.type == "xpu":
+            torch.xpu.reset_peak_memory_stats()
+        elif device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats()
         start = time.time()
         optimizer.zero_grad()
 
@@ -1078,7 +1076,7 @@ def design_binder(
         # Recompute the logits -> design transform for a fresh graph.
         design = F.softmax(logits / temperature, dim=-1)
         score_mask = gradient_mask.sum(dim=-1) > 0
-        with seed_context(seed + global_step):
+        with seed_context(seed + global_step, device_type=device.type):
             plm_loss = compute_esmc_pseudoperplexity_nll(
                 esmc_model=esmc_model,
                 binder_design=design,
@@ -1102,12 +1100,14 @@ def design_binder(
         step_losses["plm_loss"] = plm_loss.detach().cpu()
         step_losses["total_loss"] = (structure_loss + plm_loss).detach().cpu()
         step_losses["time"] = time.time() - start
-        step_losses["peak_allocated_gib"] = (
-            torch.cuda.max_memory_allocated() / BYTES_PER_GIB
-        )
-        step_losses["peak_reserved_gib"] = (
-            torch.cuda.max_memory_reserved() / BYTES_PER_GIB
-        )
+        if device.type in ("cuda", "xpu"):
+            accelerator = torch.cuda if device.type == "cuda" else torch.xpu
+            step_losses["peak_allocated_gib"] = (
+                accelerator.max_memory_allocated() / BYTES_PER_GIB
+            )
+            step_losses["peak_reserved_gib"] = (
+                accelerator.max_memory_reserved() / BYTES_PER_GIB
+            )
         trajectory[step] = step_losses
         loss_str = "  ".join(
             f"{k}={v.mean().item() if torch.is_tensor(v) else v:.4f}"
@@ -1154,7 +1154,7 @@ def design_binder(
     ) -> None:
         best_seq = best_sequences[batch_idx]
         binder_seq = best_seq.split("|")[-1]
-        binder_design = sequence_to_one_hot(binder_seq)[..., 2:22]
+        binder_design = sequence_to_one_hot(binder_seq, device=device)[..., 2:22]
         final_fold = fold_and_get_distogram(
             critic_model,
             target_sequence,
@@ -1197,12 +1197,13 @@ def design_binder(
 
     for critic_name in scaling_critic_names or []:
         critic_model = _load_hf_model(
-            critic_name, lm_dropout=0.25, cache_esmc=False, device="cuda"
+            critic_name, lm_dropout=0.25, cache_esmc=False, device=device
         )
         for batch_idx in range(batch_size):
             score_critic(critic_name, critic_model, batch_idx, is_scaling_critic=True)
         del critic_model
-        torch.cuda.empty_cache()
+        if device.type in ("cuda", "xpu"):
+            (torch.cuda if device.type == "cuda" else torch.xpu).empty_cache()
 
     if not critic_results:
         for batch_idx in range(batch_size):
@@ -1225,24 +1226,24 @@ _ESMC_CACHE: dict[str, torch.nn.Module] = {}
 
 
 def _load_hf_model(
-    critic_name: str, lm_dropout: float, cache_esmc: bool, device: str
+    model_path: str | Path,
+    lm_dropout: float,
+    esmc_path: str | Path,
+    device: torch.device,
 ) -> Any:
-    """Loads ESMFold2 from huggingface. Will cache ESMC by checkpoint ID among
-    all non-scaling checkpoints, to save on VRAM and load time."""
-    repo_id = f"biohub/{critic_name}"
-    model = EsmFold2ExperimentalModel.from_pretrained(repo_id, load_esmc=not cache_esmc)
-    if cache_esmc:
-        esmc_id = model.config.esmc_id
-        if esmc_id not in _ESMC_CACHE:
-            model.load_esmc(esmc_id)
+    """Load a verified local experimental checkpoint with a shared local ESMC trunk."""
+    model = EsmFold2ExperimentalModel.from_pretrained(str(model_path), load_esmc=False)
+    if model.esmc is None:
+        if "esmc" not in _ESMC_CACHE:
+            model.load_esmc(str(esmc_path))
             assert model.esmc is not None
-            _ESMC_CACHE[esmc_id] = model.esmc
-        model.esmc = _ESMC_CACHE[esmc_id]
+            _ESMC_CACHE["esmc"] = model.esmc
+        model.esmc = _ESMC_CACHE["esmc"]
     model.configure_lm_dropout(lm_dropout, force_lm_dropout_during_inference=True)
     kernel_backend = None
-    if TRITON_KERNELS_AVAILABLE:
+    if device.type == "cuda" and TRITON_KERNELS_AVAILABLE:
         kernel_backend = BACKEND_FUSED
-    elif CUE_AVAILABLE:
+    elif device.type == "cuda" and CUE_AVAILABLE:
         kernel_backend = BACKEND_CUEQ
     model.set_kernel_backend(kernel_backend)
     return model.to(device=device).eval().requires_grad_(False)
@@ -1265,45 +1266,27 @@ def _apply_torch_compile(model: torch.nn.Module) -> None:
 
 class ESMFold2Design:
     lm_name = "biohub/ESMC-6B"
-    inversion_model_names: list[str] = [
-        "ESMFold2-Experimental-Fast",
-        "ESMFold2-Experimental-Fast-Cutoff2025",
-    ]
-    hero_critic_hf_paths: list[str] = [
-        "ESMFold2-Experimental-Fast",
-        "ESMFold2-Experimental-Fast-Cutoff2025",
-        "ESMFold2-Experimental",
-        "ESMFold2-Experimental-Cutoff2025",
-    ]
-    scaling_critic_hf_paths: list[str] = []
 
-    def load(self, use_scaling_critics: bool):
-        self.scaling_critic_hf_paths = []
-        if use_scaling_critics:
-            self.scaling_critic_hf_paths = [
-                f"ESMFold2-Experimental-Fast-base{size}-step{step}k"
-                for size in ("300M", "600M", "6B")
-                for step in ("250", "500", "750", "1000", "1500")
-            ]
-
+    def load(
+        self,
+        inversion_path: str | Path,
+        critic_path: str | Path,
+        esmc_path: str | Path,
+        device: str = "xpu",
+    ):
+        self.device = torch.device(device)
         self.inversion_models = {
-            model_name: _load_hf_model(
-                model_name, lm_dropout=0.5, cache_esmc=True, device="cuda"
+            "ESMFold2-Experimental-Fast": _load_hf_model(
+                inversion_path, lm_dropout=0.5, esmc_path=esmc_path, device=self.device
             )
-            for model_name in self.inversion_model_names
         }
-        if COMPILE:
-            for model in self.inversion_models.values():
-                _apply_torch_compile(model)
-
-        self.hf_critic_models: dict[str, Any] = {}
-        for name in self.hero_critic_hf_paths:
-            self.hf_critic_models[name] = _load_hf_model(
-                name, lm_dropout=0.25, cache_esmc=True, device="cuda"
+        self.hf_critic_models = {
+            "ESMFold2-Experimental": _load_hf_model(
+                critic_path, lm_dropout=0.25, esmc_path=esmc_path, device=self.device
             )
-
+        }
         self.esmc_model = EsmcForMaskedLM.from_pretrained(
-            self.lm_name, dtype=torch.float32
+            str(esmc_path), dtype=torch.float32
         )
         if REUSE_ESMC:
             reusable_esmc_model = self.inversion_models["ESMFold2-Experimental-Fast"]
@@ -1313,9 +1296,10 @@ class ESMFold2Design:
             )
             assert reusable_esmc_model.esmc is not None
             del self.esmc_model.esmc
-            torch.cuda.empty_cache()
+            if self.device.type in ("cuda", "xpu"):
+                (torch.cuda if self.device.type == "cuda" else torch.xpu).empty_cache()
             self.esmc_model.esmc = reusable_esmc_model.esmc
-        self.esmc_model = self.esmc_model.cuda().eval().requires_grad_(False)
+        self.esmc_model = self.esmc_model.to(self.device).eval().requires_grad_(False)
 
     def design(
         self,
@@ -1333,7 +1317,7 @@ class ESMFold2Design:
             self.inversion_models,
             self.hf_critic_models,
             self.esmc_model,
-            self.scaling_critic_hf_paths,
+            None,
             target_name=target_name,
             target_sequence=target_sequence,
             binder_name=binder_name,
@@ -1343,155 +1327,5 @@ class ESMFold2Design:
             batch_size=batch_size,
             target_hotspot_ids=target_hotspot_ids,
             epitope_contact_distance=epitope_contact_distance,
+            device=self.device,
         )
-
-
-# ---- Modal ----
-
-
-def get_base_image():
-    return (
-        modal.Image.micromamba(python_version="3.12")
-        .run_commands("apt update && apt install -y git build-essential")
-        .micromamba_install(
-            "anarci>=2020.04.03",
-            "hmmer=3.4",
-            "cuda-version=12.8",
-            "cuda-libraries-dev=12.8",
-            "cuda-nvcc=12.8",
-            "cmake",
-            "ninja",
-            channels=["conda-forge", "bioconda"],
-        )
-        .pip_install(
-            "torch==2.8.0",
-            "triton==3.4.0",
-            index_url="https://download.pytorch.org/whl/cu128",
-        )
-        .pip_install(
-            "flash-attn==2.8.3",
-            "transformer-engine[core-cu12,pytorch]==2.13.0",
-            "xformers==0.0.32.post1",
-            extra_options="--no-build-isolation",
-            env={
-                "CPATH": (
-                    "/opt/conda/lib/python3.12/site-packages/nvidia/cudnn/include:"
-                    "/opt/conda/lib/python3.12/site-packages/nvidia/nccl/include:"
-                    "/opt/conda/lib/python3.12/site-packages/nvidia/nvtx/include"
-                ),
-                "LIBRARY_PATH": (
-                    "/opt/conda/lib/python3.12/site-packages/nvidia/cudnn/lib:"
-                    "/opt/conda/lib/python3.12/site-packages/nvidia/nccl/lib:"
-                    "/opt/conda/lib/python3.12/site-packages/nvidia/nvtx/lib"
-                ),
-                "MAX_JOBS": "8",
-                "NVTE_FRAMEWORK": "pytorch",
-            },
-        )
-        .pip_install("abnumber", "esm", "modal")
-        .env(
-            {
-                "HF_HOME": "/models",
-                "HF_XET_HIGH_PERFORMANCE": "1",
-                "XFORMERS_IGNORE_FLASH_VERSION_CHECK": "1",
-            }
-        )
-    )
-
-
-app = modal.App(
-    name="esmfold2-design",
-    image=get_base_image(),
-    volumes={
-        "/models": modal.Volume.from_name("esmfold2-models", create_if_missing=True)
-    },
-)
-
-
-# NOTE - Currently the memory usage is quite high, inflating costs.
-# In an update coming soon, scaling critics will be loaded on demand
-# to avoid needing this large amount of RAM.
-@app.cls(gpu="H100", timeout=60 * 60, cpu=16, memory=80 * 1024)
-class ESMFold2DesignModal(ESMFold2Design):
-    """Modal entrypoint. Hero critics are HF experimental exports with
-    confidence heads. Set ``use_scaling_critics=True`` to also load the
-    15-checkpoint scaling-experiment ensemble (distogram binding confidence only).
-    """
-
-    use_scaling_critics: bool = modal.parameter(default=True)
-    deterministic: bool = modal.parameter(default=False)
-
-    @modal.enter()
-    def load(self):
-        if self.deterministic:
-            torch.use_deterministic_algorithms(True, warn_only=True)
-        return super().load(self.use_scaling_critics)
-
-    @modal.method()
-    def design(self, *args, **kws):
-        return super().design(*args, **kws)
-
-
-@app.local_entrypoint()
-def main(
-    target_name: str,
-    binder_name: str,
-    target_sequence: str | None = None,
-    binder_sequence: str | None = None,
-    use_scaling_critics: bool = True,
-    is_antibody: bool | None = None,
-    local: bool = False,
-    seed: int = 0,
-    batch_size: int = 1,
-    target_hotspot_ids: list[str] | None = None,
-    epitope_contact_distance: float = 12.0,
-):
-    if local:
-        assert not use_scaling_critics, (
-            "'abnumber' will fail if running this script with uv run. "
-            "It requires conda packages.  To be addressed soon."
-        )
-        app = ESMFold2Design()
-        app.load(use_scaling_critics)
-        run_fn = app.design
-    else:
-        app = ESMFold2DesignModal(
-            use_scaling_critics=use_scaling_critics  # ty:ignore[unknown-argument]
-        )
-        run_fn = app.design.remote
-
-    seq, trajectory, results = run_fn(
-        target_name=target_name,
-        target_sequence=target_sequence,
-        binder_name=binder_name,
-        binder_sequence=binder_sequence,
-        is_antibody=is_antibody,
-        seed=seed,
-        batch_size=batch_size,
-        target_hotspot_ids=target_hotspot_ids,
-        epitope_contact_distance=epitope_contact_distance,
-    )
-
-    avg_final_loss = sum(r["final_loss"] for r in results) / len(results)
-    logger.info(f"\nDesigned sequence: {seq}")
-    logger.info(f"Trajectory length: {len(trajectory)} steps")
-    logger.info(f"Average final loss: {avg_final_loss:.4f}")
-
-
-if __name__ == "__main__":
-    # Run a single local design.
-    main(
-        # Example case 1
-        target_name="pd-l1",
-        binder_name="minibinder",
-        is_antibody=False,
-        # Example case 2
-        # target_name="cd45",
-        # binder_name="trastuzumab_framework_vhvl",
-        # is_antibody=True,
-        # Common settings
-        seed=0,
-        batch_size=1,
-        local=True,
-        use_scaling_critics=True,
-    )
